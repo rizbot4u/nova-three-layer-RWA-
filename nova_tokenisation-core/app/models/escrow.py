@@ -1,0 +1,41 @@
+import uuid
+from sqlalchemy import (
+    BigInteger, Column, DateTime, ForeignKey, Numeric, String, Text, func,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import relationship
+from app.database import Base
+
+
+class EscrowOrder(Base):
+    __tablename__ = "escrow_orders"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    audit_status = Column(String(16), nullable=True, default="PENDING")
+    last_audited_at = Column(DateTime(timezone=True), nullable=True)
+    direction = Column(Text, nullable=False, default="buy")   # buy | sell
+    investor_wallet = Column(String(42), nullable=False)
+    asset_contract = Column(String(42), nullable=False)       # NVP-1 address
+    currency_contract = Column(String(42), nullable=False)    # DKHYR address
+    share_amount = Column(BigInteger, nullable=False)         # whole tokens
+    price_dkhyr = Column(Numeric(20, 4), nullable=False)      # DKHYR per share
+    total_dkhyr = Column(Numeric(20, 4), nullable=False)      # share_amount * price_dkhyr
+    state = Column(Text, nullable=False, default="pending")
+    deposit_tx_hash = Column(Text, unique=True, nullable=True)
+    settlement_tx_hash = Column(Text, unique=True, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    events = relationship("EscrowEvent", back_populates="order", cascade="all, delete-orphan")
+
+
+class EscrowEvent(Base):
+    __tablename__ = "escrow_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    order_id = Column(UUID(as_uuid=True), ForeignKey("escrow_orders.id"), nullable=False)
+    event_type = Column(Text, nullable=False)
+    payload = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    order = relationship("EscrowOrder", back_populates="events")

@@ -1,0 +1,179 @@
+from datetime import datetime
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.models.escrow import EscrowEvent, EscrowOrder
+from app.schemas.escrow import (
+    EscrowActionResponse,
+    EscrowCreateRequest,
+    EscrowDetail,
+)
+from app.services.settlement_service import settlement_service
+
+router = APIRouter(prefix="/api/v1/escrow", tags=["Layer 3: Payments & Escrow"])
+
+
+async def _log(db: AsyncSession, order_id, event_type: str, payload: dict | None = None):
+    ev = EscrowEvent(order_id=order_id, event_type=event_type, payload=payload or {})
+    db.add(ev)
+    await db.commit()
+
+
+@router.post("/create", response_model=EscrowActionResponse, status_code=status.HTTP_201_CREATED)
+async def create_escrow_order(payload: EscrowCreateRequest, db: AsyncSession = Depends(get_db)):
+    total_usd = payload.share_amount * payload.price_per_share_usd
+
+    order = EscrowOrder(
+        investor_wallet=payload.investor_wallet,
+        property_contract=payload.property_contract,
+        share_amount=payload.share_amount,
+        total_usd=total_usd,
+        state="pending",
+    )
+    db.add(order)
+    await db.commit()
+    await db.refresh(order)
+
+    await _log(db, order.id, "ORDER_CREATED", {
+        "shares": payload.share_amount,
+        "price_per_share_usd": payload.price_per_share_usd,
+        "total_usd": float(total_usd),
+        "property_contract": payload.property_contract,
+    })
+
+    return EscrowActionResponse(
+        order_id=order.id,
+        state=order.state,
+        message="Escrow order created.",
+        updated_at=order.updated_at,
+    )
+
+
+@router.post("/{order_id}/fund", response_model=EscrowActionResponse)
+async def fund_escrow_order(
+    order_id: UUID,
+    deposit_tx_hash: str,
+    db: AsyncSession = Depends(get_db),
+):
+    order = (await db.execute(select(EscrowOrder).where(EscrowOrder.id == order_id))).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Escrow order not found")
+    if order.state != "pending":
+        raise HTTPException(status_code=400, detail=f"Cannot fund order in state '{order.state}'")
+
+    order.state = "funded"
+    order.deposit_tx_hash = deposit_tx_hash
+    await db.commit()
+    await db.refresh(order)
+
+    await _log(db, order.id, "ORDER_FUNDED", {"tx_hash": deposit_tx_hash})
+
+    return EscrowActionResponse(
+        order_id=order.id,
+        state=order.state,
+        message="Escrow funded.",
+        updated_at=order.updated_at,
+    )
+
+
+@router.post("/{order_id}/settle", response_model=EscrowActionResponse)
+async def settle_escrow_order(order_id: UUID, db: AsyncSession = Depends(get_db)):
+    order = (await db.execute(select(EscrowOrder).where(EscrowOrder.id == order_id))).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Escrow order not found")
+    if order.state != "funded":
+        raise HTTPException(status_code=400, detail=f"Order must be 'funded' to settle (currently '{order.state}')")
+
+    try:
+        tx_hash = settlement_service.send_shares(
+            property_contract=order.property_contract,
+            to_wallet=order.investor_wallet,
+            amount=int(order.share_amount),
+        )
+    except Exception as e:
+        await _log(db, order.id, "ORDER_SETTLE_FAILED", {"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Settlement failed: {e}")
+
+    order.state = "settled"
+    order.settlement_tx_hash = tx_hash
+    await db.commit()
+    await db.refresh(order)
+
+    await _log(db, order.id, "ORDER_SETTLED", {
+        "tx_hash": tx_hash,
+        "shares": int(order.share_amount),
+        "to": order.investor_wallet,
+    })
+
+    return EscrowActionResponse(
+        order_id=order.id,
+        state=order.state,
+        message="Shares transferred from treasury on Base Mainnet.",
+        settlement_tx_hash=tx_hash,
+        updated_at=order.updated_at,
+    )
+
+
+@router.post("/{order_id}/cancel", response_model=EscrowActionResponse)
+async def cancel_escrow_order(order_id: UUID, db: AsyncSession = Depends(get_db)):
+    order = (await db.execute(select(EscrowOrder).where(EscrowOrder.id == order_id))).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Escrow order not found")
+    if order.state not in ("pending", "funded"):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel order in state '{order.state}'")
+
+    order.state = "cancelled"
+    await db.commit()
+    await db.refresh(order)
+
+    await _log(db, order.id, "ORDER_CANCELLED", {})
+
+    return EscrowActionResponse(
+        order_id=order.id,
+        state=order.state,
+        message="Escrow cancelled.",
+        updated_at=order.updated_at,
+    )
+
+
+@router.get("/{order_id}", response_model=EscrowDetail)
+async def get_escrow_order(order_id: UUID, db: AsyncSession = Depends(get_db)):
+    order = (await db.execute(select(EscrowOrder).where(EscrowOrder.id == order_id))).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Escrow order not found")
+    return EscrowDetail(
+        order_id=order.id,
+        investor_wallet=order.investor_wallet,
+        property_contract=order.property_contract,
+        share_amount=order.share_amount,
+        total_usd=float(order.total_usd),
+        state=order.state,
+        deposit_tx_hash=order.deposit_tx_hash,
+        settlement_tx_hash=order.settlement_tx_hash,
+        created_at=order.created_at,
+        updated_at=order.updated_at,
+    )
+
+
+@router.get("/", response_model=list[EscrowDetail])
+async def list_escrow_orders(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(EscrowOrder).order_by(EscrowOrder.created_at.desc()).limit(100))
+    return [
+        EscrowDetail(
+            order_id=o.id,
+            investor_wallet=o.investor_wallet,
+            property_contract=o.property_contract,
+            share_amount=o.share_amount,
+            total_usd=float(o.total_usd),
+            state=o.state,
+            deposit_tx_hash=o.deposit_tx_hash,
+            settlement_tx_hash=o.settlement_tx_hash,
+            created_at=o.created_at,
+            updated_at=o.updated_at,
+        )
+        for o in result.scalars().all()
+    ]

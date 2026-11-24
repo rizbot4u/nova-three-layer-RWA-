@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nova_postgres
+    environment:
+      POSTGRES_USER: nova
+      POSTGRES_PASSWORD: nova_dev_password
+      POSTGRES_DB: nova_tokenisation
+    ports: ["5432:5432"]
+    volumes:
+      - nova_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nova"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nova_redis
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: nova_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nova:nova_dev_password@postgres:5432/nova_tokenisation
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+      JWT_SECRET: change_me_in_production
+      TREASURY_PRIVATE_KEY: ${TREASURY_PRIVATE_KEY}
+      TREASURY_WALLET_ADDRESS: ${TREASURY_WALLET_ADDRESS}
+      BASE_RPC_URL: ${BASE_RPC_URL}
+    ports: ["8100:8000"]
+    volumes: [".:/app"]
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  nova_pg_data:
+
+  nova-sentinel:
+    build: .
+    container_name: nova-sentinel
+    command: python3 -m app.sentinel.daemon
+    env_file: .env
+    volumes:
+      - .:/app
+    depends_on:
+      - api
+      - db
+    restart: unless-stopped
